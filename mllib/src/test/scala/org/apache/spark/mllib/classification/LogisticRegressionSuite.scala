@@ -17,17 +17,19 @@
 
 package org.apache.spark.mllib.classification
 
-import scala.util.control.Breaks._
+import scala.collection.JavaConverters._
 import scala.util.Random
-import scala.collection.JavaConversions._
+import scala.util.control.Breaks._
 
-import org.scalatest.FunSuite
 import org.scalatest.Matchers
 
+import org.apache.spark.SparkFunSuite
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.mllib.regression._
 import org.apache.spark.mllib.util.{LocalClusterSparkContext, MLlibTestSparkContext}
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.util.Utils
+
 
 object LogisticRegressionSuite {
 
@@ -36,7 +38,7 @@ object LogisticRegressionSuite {
     scale: Double,
     nPoints: Int,
     seed: Int): java.util.List[LabeledPoint] = {
-    seqAsJavaList(generateLogisticInput(offset, scale, nPoints, seed))
+    generateLogisticInput(offset, scale, nPoints, seed).asJava
   }
 
   // Generate input of the form Y = logistic(offset + scale*X)
@@ -89,21 +91,22 @@ object LogisticRegressionSuite {
       seed: Int): Seq[LabeledPoint] = {
     val rnd = new Random(seed)
 
-    val xDim = xMean.size
+    val xDim = xMean.length
     val xWithInterceptsDim = if (addIntercept) xDim + 1 else xDim
-    val nClasses = weights.size / xWithInterceptsDim + 1
+    val nClasses = weights.length / xWithInterceptsDim + 1
 
     val x = Array.fill[Vector](nPoints)(Vectors.dense(Array.fill[Double](xDim)(rnd.nextGaussian())))
 
-    x.map(vector => {
+    x.foreach { vector =>
       // This doesn't work if `vector` is a sparse vector.
       val vectorArray = vector.toArray
       var i = 0
-      while (i < vectorArray.size) {
+      val len = vectorArray.length
+      while (i < len) {
         vectorArray(i) = vectorArray(i) * math.sqrt(xVariance(i)) + xMean(i)
         i += 1
       }
-    })
+    }
 
     val y = (0 until nPoints).map { idx =>
       val xArray = x(idx).toArray
@@ -116,7 +119,7 @@ object LogisticRegressionSuite {
       }
       // Preventing the overflow when we compute the probability
       val maxMargin = margins.max
-      if (maxMargin > 0) for (i <-0 until nClasses) margins(i) -= maxMargin
+      if (maxMargin > 0) for (i <- 0 until nClasses) margins(i) -= maxMargin
 
       // Computing the probabilities for each class from the margins.
       val norm = {
@@ -127,7 +130,7 @@ object LogisticRegressionSuite {
         }
         temp
       }
-      for (i <-0 until nClasses) probs(i) /= norm
+      for (i <- 0 until nClasses) probs(i) /= norm
 
       // Compute the cumulative probability so we can generate a random number and assign a label.
       for (i <- 1 until nClasses) probs(i) += probs(i - 1)
@@ -147,9 +150,26 @@ object LogisticRegressionSuite {
     val testData = (0 until nPoints).map(i => LabeledPoint(y(i), x(i)))
     testData
   }
+
+  /** Binary labels, 3 features */
+  private val binaryModel = new LogisticRegressionModel(
+    weights = Vectors.dense(0.1, 0.2, 0.3), intercept = 0.5, numFeatures = 3, numClasses = 2)
+
+  /** 3 classes, 2 features */
+  private val multiclassModel = new LogisticRegressionModel(
+    weights = Vectors.dense(0.1, 0.2, 0.3, 0.4), intercept = 1.0, numFeatures = 2, numClasses = 3)
+
+  private def checkModelsEqual(a: LogisticRegressionModel, b: LogisticRegressionModel): Unit = {
+    assert(a.weights == b.weights)
+    assert(a.intercept == b.intercept)
+    assert(a.numClasses == b.numClasses)
+    assert(a.numFeatures == b.numFeatures)
+    assert(a.getThreshold == b.getThreshold)
+  }
 }
 
-class LogisticRegressionSuite extends FunSuite with MLlibTestSparkContext with Matchers {
+
+class LogisticRegressionSuite extends SparkFunSuite with MLlibTestSparkContext with Matchers {
   def validatePrediction(
       predictions: Seq[Double],
       input: Seq[LabeledPoint],
@@ -176,6 +196,7 @@ class LogisticRegressionSuite extends FunSuite with MLlibTestSparkContext with M
       .setStepSize(10.0)
       .setRegParam(0.0)
       .setNumIterations(20)
+      .setConvergenceTol(0.0005)
 
     val model = lr.run(testRDD)
 
@@ -353,8 +374,12 @@ class LogisticRegressionSuite extends FunSuite with MLlibTestSparkContext with M
     testRDD2.cache()
     testRDD3.cache()
 
+    val numIteration = 10
+
     val lrA = new LogisticRegressionWithLBFGS().setIntercept(true)
+    lrA.optimizer.setNumIterations(numIteration)
     val lrB = new LogisticRegressionWithLBFGS().setIntercept(true).setFeatureScaling(false)
+    lrB.optimizer.setNumIterations(numIteration)
 
     val modelA1 = lrA.run(testRDD1, initialWeights)
     val modelA2 = lrA.run(testRDD2, initialWeights)
@@ -401,6 +426,12 @@ class LogisticRegressionSuite extends FunSuite with MLlibTestSparkContext with M
     lr.optimizer.setConvergenceTol(1E-15).setNumIterations(200)
 
     val model = lr.run(testRDD)
+
+    val numFeatures = testRDD.map(_.features.size).first()
+    val initialWeights = Vectors.dense(new Array[Double]((numFeatures + 1) * 2))
+    val model2 = lr.run(testRDD, initialWeights)
+
+    LogisticRegressionSuite.checkModelsEqual(model, model2)
 
     /**
      * The following is the instruction to reproduce the model using R's glmnet package.
@@ -462,9 +493,56 @@ class LogisticRegressionSuite extends FunSuite with MLlibTestSparkContext with M
 
   }
 
+  test("model save/load: binary classification") {
+    // NOTE: This will need to be generalized once there are multiple model format versions.
+    val model = LogisticRegressionSuite.binaryModel
+
+    model.clearThreshold()
+    assert(model.getThreshold.isEmpty)
+
+    val tempDir = Utils.createTempDir()
+    val path = tempDir.toURI.toString
+
+    // Save model, load it back, and compare.
+    try {
+      model.save(sc, path)
+      val sameModel = LogisticRegressionModel.load(sc, path)
+      LogisticRegressionSuite.checkModelsEqual(model, sameModel)
+    } finally {
+      Utils.deleteRecursively(tempDir)
+    }
+
+    // Save model with threshold.
+    try {
+      model.setThreshold(0.7)
+      model.save(sc, path)
+      val sameModel = LogisticRegressionModel.load(sc, path)
+      LogisticRegressionSuite.checkModelsEqual(model, sameModel)
+    } finally {
+      Utils.deleteRecursively(tempDir)
+    }
+  }
+
+  test("model save/load: multiclass classification") {
+    // NOTE: This will need to be generalized once there are multiple model format versions.
+    val model = LogisticRegressionSuite.multiclassModel
+
+    val tempDir = Utils.createTempDir()
+    val path = tempDir.toURI.toString
+
+    // Save model, load it back, and compare.
+    try {
+      model.save(sc, path)
+      val sameModel = LogisticRegressionModel.load(sc, path)
+      LogisticRegressionSuite.checkModelsEqual(model, sameModel)
+    } finally {
+      Utils.deleteRecursively(tempDir)
+    }
+  }
+
 }
 
-class LogisticRegressionClusterSuite extends FunSuite with LocalClusterSparkContext {
+class LogisticRegressionClusterSuite extends SparkFunSuite with LocalClusterSparkContext {
 
   test("task size should be small in both training and prediction using SGD optimizer") {
     val m = 4
